@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 static void debug_callback(void *context, int level, const char *message)
 {
     (void) context;
@@ -16,6 +20,37 @@ static void print_version(const char *label, const char *name, int version, int 
            name ? name : "(unnamed)",
            (version >> 16) & 0xffff, (version >> 8) & 0xff, version & 0xff,
            (api >> 16) & 0xffff, (api >> 8) & 0xff, api & 0xff);
+}
+
+static void dirname_copy(const char *path, char *out, size_t out_size)
+{
+    const char *slash;
+    size_t len;
+
+    if (out == NULL || out_size == 0)
+        return;
+
+    if (path == NULL || path[0] == '\0')
+    {
+        snprintf(out, out_size, ".");
+        return;
+    }
+
+    slash = strrchr(path, '/');
+    if (slash == NULL)
+    {
+        snprintf(out, out_size, ".");
+        return;
+    }
+
+    len = (size_t) (slash - path);
+    if (len == 0)
+        len = 1;
+    if (len >= out_size)
+        len = out_size - 1;
+
+    memcpy(out, path, len);
+    out[len] = '\0';
 }
 
 static int load_plugin(m64p_modular_core *core,
@@ -48,6 +83,8 @@ int main(int argc, char **argv)
     m64p_modular_plugin input = {0};
     m64p_modular_plugin rsp = {0};
     const char *core_path;
+    const char *data_path;
+    char core_dir[PATH_MAX];
     m64p_error result;
     int started = 0;
     int status = 1;
@@ -58,12 +95,17 @@ int main(int argc, char **argv)
                 "Usage: %s CORE [GFX|-] [AUDIO|-] [INPUT|-] [RSP|-]\n"
                 "\n"
                 "CORE may be '-' to search libmupen64plus.so.2/libmupen64plus.so.\n"
-                "The probe only validates ABI loading, PluginStartup and CoreAttachPlugin.\n",
+                "When CORE is an explicit path, its directory is also used as the\n"
+                "Mupen64Plus shared-data directory (Glide64mk2.ini, mupen64plus.ini, etc.).\n"
+                "The probe validates ABI loading, PluginStartup and CoreAttachPlugin.\n",
                 argv[0]);
         return 2;
     }
 
     core_path = strcmp(argv[1], "-") == 0 ? NULL : argv[1];
+    dirname_copy(core_path, core_dir, sizeof(core_dir));
+    data_path = core_path ? core_dir : ".";
+
     result = m64p_modular_core_load(&core, core_path);
     if (result != M64ERR_SUCCESS)
     {
@@ -73,9 +115,10 @@ int main(int argc, char **argv)
 
     print_version("CORE", core.name, core.version, core.api_version);
     printf("Core capabilities: 0x%x\n", core.capabilities);
+    printf("Shared data path: %s\n", data_path);
 
     result = core.startup(M64P_MODULAR_CORE_API_VERSION,
-                          ".", ".",
+                          ".", data_path,
                           NULL, debug_callback,
                           NULL, NULL);
     if (result != M64ERR_SUCCESS)
