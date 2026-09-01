@@ -37,6 +37,7 @@ typedef struct m64p_modular_plugin
     m64p_plugin_type type;
     int version;
     int api_version;
+    int capabilities;
     const char *name;
     int attached;
 } m64p_modular_plugin;
