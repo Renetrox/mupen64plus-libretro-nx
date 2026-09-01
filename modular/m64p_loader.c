@@ -7,6 +7,136 @@
 
 static char g_last_error[512];
 
+/*
+ * The NX snapshot in this repository predates the Mupen64Plus 2.6 VidExt
+ * expansion.  Its public m64p_video_extension_functions has 12 callbacks,
+ * while the standalone 2.6 core requires a 17-callback table.  Keep the old
+ * headers isolated and translate the table here when a 2.6+ core is loaded.
+ */
+typedef enum
+{
+    MODULAR_RENDER_OPENGL = 0,
+    MODULAR_RENDER_VULKAN = 1
+} modular_render_mode;
+
+typedef struct
+{
+    unsigned int Functions;
+    m64p_error    (*VidExtFuncInit)(void);
+    m64p_error    (*VidExtFuncQuit)(void);
+    m64p_error    (*VidExtFuncListModes)(m64p_2d_size *, int *);
+    m64p_error    (*VidExtFuncListRates)(m64p_2d_size, int *, int *);
+    m64p_error    (*VidExtFuncSetMode)(int, int, int, int, int);
+    m64p_error    (*VidExtFuncSetModeWithRate)(int, int, int, int, int, int);
+    m64p_function (*VidExtFuncGLGetProc)(const char *);
+    m64p_error    (*VidExtFuncGLSetAttr)(m64p_GLattr, int);
+    m64p_error    (*VidExtFuncGLGetAttr)(m64p_GLattr, int *);
+    m64p_error    (*VidExtFuncGLSwapBuf)(void);
+    m64p_error    (*VidExtFuncSetCaption)(const char *);
+    m64p_error    (*VidExtFuncToggleFS)(void);
+    m64p_error    (*VidExtFuncResizeWindow)(int, int);
+    uint32_t      (*VidExtFuncGLGetDefaultFramebuffer)(void);
+    m64p_error    (*VidExtFuncInitWithRenderMode)(modular_render_mode);
+    m64p_error    (*VidExtFuncVKGetSurface)(void **, void *);
+    m64p_error    (*VidExtFuncVKGetInstanceExtensions)(const char **[], uint32_t *);
+} modular_vidext_v26;
+
+typedef m64p_error (*raw_override_vidext_t)(void *);
+
+static raw_override_vidext_t g_override_vidext_raw;
+static m64p_video_extension_functions g_legacy_vidext;
+
+static m64p_error compat_list_rates(m64p_2d_size size, int *num_rates, int *rates)
+{
+    (void) size;
+
+    if (num_rates == NULL)
+        return M64ERR_INPUT_ASSERT;
+
+    if (rates != NULL && *num_rates > 0)
+    {
+        rates[0] = 60;
+        *num_rates = 1;
+    }
+    else
+    {
+        *num_rates = 0;
+    }
+
+    return M64ERR_SUCCESS;
+}
+
+static m64p_error compat_set_mode_with_rate(int width, int height, int refresh_rate,
+                                            int bpp, int mode, int flags)
+{
+    (void) refresh_rate;
+
+    if (g_legacy_vidext.VidExtFuncSetMode == NULL)
+        return M64ERR_INPUT_ASSERT;
+
+    return g_legacy_vidext.VidExtFuncSetMode(width, height, bpp, mode, flags);
+}
+
+static m64p_error compat_init_with_render_mode(modular_render_mode mode)
+{
+    if (mode != MODULAR_RENDER_OPENGL)
+        return M64ERR_UNSUPPORTED;
+
+    if (g_legacy_vidext.VidExtFuncInit == NULL)
+        return M64ERR_INPUT_ASSERT;
+
+    return g_legacy_vidext.VidExtFuncInit();
+}
+
+static m64p_error compat_vk_get_surface(void **surface, void *instance)
+{
+    (void) surface;
+    (void) instance;
+    return M64ERR_UNSUPPORTED;
+}
+
+static m64p_error compat_vk_get_instance_extensions(const char **extensions[],
+                                                    uint32_t *num_extensions)
+{
+    (void) extensions;
+    (void) num_extensions;
+    return M64ERR_UNSUPPORTED;
+}
+
+static m64p_error compat_override_vidext_v26(m64p_video_extension_functions *legacy)
+{
+    modular_vidext_v26 table;
+
+    if (g_override_vidext_raw == NULL)
+        return M64ERR_NOT_INIT;
+    if (legacy == NULL)
+        return M64ERR_INPUT_ASSERT;
+
+    memcpy(&g_legacy_vidext, legacy, sizeof(g_legacy_vidext));
+    memset(&table, 0, sizeof(table));
+
+    table.Functions = 17;
+    table.VidExtFuncInit = g_legacy_vidext.VidExtFuncInit;
+    table.VidExtFuncQuit = g_legacy_vidext.VidExtFuncQuit;
+    table.VidExtFuncListModes = g_legacy_vidext.VidExtFuncListModes;
+    table.VidExtFuncListRates = compat_list_rates;
+    table.VidExtFuncSetMode = g_legacy_vidext.VidExtFuncSetMode;
+    table.VidExtFuncSetModeWithRate = compat_set_mode_with_rate;
+    table.VidExtFuncGLGetProc = g_legacy_vidext.VidExtFuncGLGetProc;
+    table.VidExtFuncGLSetAttr = g_legacy_vidext.VidExtFuncGLSetAttr;
+    table.VidExtFuncGLGetAttr = g_legacy_vidext.VidExtFuncGLGetAttr;
+    table.VidExtFuncGLSwapBuf = g_legacy_vidext.VidExtFuncGLSwapBuf;
+    table.VidExtFuncSetCaption = g_legacy_vidext.VidExtFuncSetCaption;
+    table.VidExtFuncToggleFS = g_legacy_vidext.VidExtFuncToggleFS;
+    table.VidExtFuncResizeWindow = g_legacy_vidext.VidExtFuncResizeWindow;
+    table.VidExtFuncGLGetDefaultFramebuffer = g_legacy_vidext.VidExtFuncGLGetDefaultFramebuffer;
+    table.VidExtFuncInitWithRenderMode = compat_init_with_render_mode;
+    table.VidExtFuncVKGetSurface = compat_vk_get_surface;
+    table.VidExtFuncVKGetInstanceExtensions = compat_vk_get_instance_extensions;
+
+    return g_override_vidext_raw(&table);
+}
+
 static void set_error(const char *fmt, ...)
 {
     va_list ap;
@@ -74,6 +204,7 @@ m64p_error m64p_modular_core_load(m64p_modular_core *core, const char *path)
     ptr_PluginGetVersion get_version;
     m64p_plugin_type type = M64PLUGIN_NULL;
     m64p_error result;
+    void *override_symbol;
 
     if (core == NULL)
         return M64ERR_INPUT_ASSERT;
@@ -119,19 +250,32 @@ m64p_error m64p_modular_core_load(m64p_modular_core *core, const char *path)
     core->attach_plugin = (ptr_CoreAttachPlugin) load_symbol(core->handle, "CoreAttachPlugin");
     core->detach_plugin = (ptr_CoreDetachPlugin) load_symbol(core->handle, "CoreDetachPlugin");
     core->do_command = (ptr_CoreDoCommand) load_symbol(core->handle, "CoreDoCommand");
-    core->override_vidext = (ptr_CoreOverrideVidExt) load_symbol(core->handle, "CoreOverrideVidExt");
+    override_symbol = load_symbol(core->handle, "CoreOverrideVidExt");
 
     if (core->error_message == NULL || core->startup == NULL ||
         core->shutdown == NULL || core->attach_plugin == NULL ||
         core->detach_plugin == NULL || core->do_command == NULL ||
-        core->override_vidext == NULL)
+        override_symbol == NULL)
         goto invalid_core;
+
+    if (core->version >= 0x020600)
+    {
+        g_override_vidext_raw = (raw_override_vidext_t) override_symbol;
+        core->override_vidext = compat_override_vidext_v26;
+    }
+    else
+    {
+        core->override_vidext = (ptr_CoreOverrideVidExt) override_symbol;
+    }
 
     return M64ERR_SUCCESS;
 
 invalid_core:
-    dlclose(core->handle);
+    if (core->handle != NULL)
+        dlclose(core->handle);
     memset(core, 0, sizeof(*core));
+    g_override_vidext_raw = NULL;
+    memset(&g_legacy_vidext, 0, sizeof(g_legacy_vidext));
     return M64ERR_INPUT_INVALID;
 }
 
@@ -144,6 +288,8 @@ void m64p_modular_core_unload(m64p_modular_core *core)
         dlclose(core->handle);
 
     memset(core, 0, sizeof(*core));
+    g_override_vidext_raw = NULL;
+    memset(&g_legacy_vidext, 0, sizeof(g_legacy_vidext));
 }
 
 m64p_error m64p_modular_plugin_load(m64p_modular_core *core,
