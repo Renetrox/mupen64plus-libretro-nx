@@ -47,6 +47,292 @@ static bool game_loaded;
 static unsigned screen_width = 640;
 static unsigned screen_height = 480;
 static int gl_attrs[32];
+static void lr_log(enum retro_log_level level, const char *fmt, ...);
+static uint32_t vidext_default_fbo(void);
+
+typedef void (*gl_bind_framebuffer_t)(unsigned int target, unsigned int framebuffer);
+typedef void (*gl_blit_framebuffer_t)(int srcX0, int srcY0, int srcX1, int srcY1,
+                                      int dstX0, int dstY0, int dstX1, int dstY1,
+                                      unsigned int mask, unsigned int filter);
+
+typedef void (*gl_read_buffer_t)(unsigned int mode);
+typedef void (*gl_draw_buffer_t)(unsigned int mode);
+typedef void (*gl_get_integerv_t)(unsigned int pname, int *data);
+typedef unsigned int (*gl_get_error_t)(void);
+typedef void (*gl_use_program_t)(unsigned int program);
+typedef void (*gl_active_texture_t)(unsigned int texture);
+typedef void (*gl_bind_texture_t)(unsigned int target, unsigned int texture);
+typedef void (*gl_viewport_t)(int x, int y, int width, int height);
+typedef void (*gl_read_pixels_t)(int x, int y, int width, int height,
+                                     unsigned int format, unsigned int type,
+                                     void *pixels);
+
+typedef unsigned char (*gl_is_enabled_t)(unsigned int cap);
+typedef void (*gl_enable_t)(unsigned int cap);
+typedef void (*gl_disable_t)(unsigned int cap);
+typedef void (*gl_scissor_t)(int x, int y, int width, int height);
+
+static gl_bind_framebuffer_t gl_bind_framebuffer;
+static gl_blit_framebuffer_t gl_blit_framebuffer;
+static gl_read_buffer_t gl_read_buffer;
+static gl_draw_buffer_t gl_draw_buffer;
+static gl_get_integerv_t gl_get_integerv;
+static gl_get_error_t gl_get_error;
+static gl_use_program_t gl_use_program;
+static gl_active_texture_t gl_active_texture;
+static gl_bind_texture_t gl_bind_texture;
+
+static int saved_gl_program;
+static int saved_gl_active_texture;
+static int saved_gl_texture_2d;
+static int saved_gl_texture0_2d;
+static bool saved_gl_handoff;
+static gl_viewport_t gl_viewport;
+static gl_read_pixels_t gl_read_pixels;
+static gl_is_enabled_t gl_is_enabled;
+static gl_enable_t gl_enable;
+static gl_disable_t gl_disable;
+static gl_scissor_t gl_scissor;
+static bool gl_present_checked;
+static bool gl_present_logged;
+
+#define MOD_GL_FRAMEBUFFER       0x8D40u
+#define MOD_GL_READ_FRAMEBUFFER  0x8CA8u
+#define MOD_GL_DRAW_FRAMEBUFFER  0x8CA9u
+#define MOD_GL_COLOR_BUFFER_BIT  0x00004000u
+#define MOD_GL_NEAREST           0x2600u
+#define MOD_GL_BACK              0x0405u
+#define MOD_GL_COLOR_ATTACHMENT0 0x8CE0u
+#define MOD_GL_VIEWPORT                 0x0BA2u
+#define MOD_GL_READ_BUFFER              0x0C02u
+#define MOD_GL_DRAW_BUFFER              0x0C01u
+#define MOD_GL_READ_FRAMEBUFFER_BINDING 0x8CAAu
+#define MOD_GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6u
+#define MOD_GL_CURRENT_PROGRAM    0x8B8Du
+#define MOD_GL_ACTIVE_TEXTURE     0x84E0u
+#define MOD_GL_TEXTURE_BINDING_2D 0x8069u
+#define MOD_GL_TEXTURE0           0x84C0u
+#define MOD_GL_TEXTURE_2D         0x0DE1u
+#define MOD_GL_RGBA          0x1908u
+#define MOD_GL_UNSIGNED_BYTE 0x1401u
+#define MOD_GL_SCISSOR_TEST  0x0C11u
+#define MOD_GL_DEPTH_TEST    0x0B71u
+#define MOD_GL_BLEND         0x0BE2u
+#define MOD_GL_CULL_FACE     0x0B44u
+#define MOD_GL_STENCIL_TEST  0x0B90u
+#define MOD_GL_SCISSOR_BOX   0x0C10u
+
+static void resolve_present_functions(void)
+{
+    if (gl_present_checked)
+        return;
+
+    gl_present_checked = true;
+
+    if (hw.get_proc_address == NULL)
+        return;
+
+    gl_bind_framebuffer =
+        (gl_bind_framebuffer_t) hw.get_proc_address("glBindFramebuffer");
+
+    if (gl_bind_framebuffer == NULL)
+        gl_bind_framebuffer =
+            (gl_bind_framebuffer_t) hw.get_proc_address("glBindFramebufferEXT");
+
+    gl_blit_framebuffer =
+        (gl_blit_framebuffer_t) hw.get_proc_address("glBlitFramebuffer");
+
+    if (gl_blit_framebuffer == NULL)
+        gl_blit_framebuffer =
+            (gl_blit_framebuffer_t) hw.get_proc_address("glBlitFramebufferEXT");
+
+    gl_read_buffer =
+        (gl_read_buffer_t) hw.get_proc_address("glReadBuffer");
+
+    gl_draw_buffer =
+        (gl_draw_buffer_t) hw.get_proc_address("glDrawBuffer");
+
+    gl_get_integerv =
+        (gl_get_integerv_t) hw.get_proc_address("glGetIntegerv");
+
+    gl_get_error =
+        (gl_get_error_t) hw.get_proc_address("glGetError");
+
+    gl_use_program =
+        (gl_use_program_t) hw.get_proc_address("glUseProgram");
+
+    gl_active_texture =
+        (gl_active_texture_t) hw.get_proc_address("glActiveTexture");
+
+    gl_bind_texture =
+        (gl_bind_texture_t) hw.get_proc_address("glBindTexture");
+
+    gl_viewport =
+        (gl_viewport_t) hw.get_proc_address("glViewport");
+
+    gl_read_pixels =
+        (gl_read_pixels_t) hw.get_proc_address("glReadPixels");
+
+    gl_is_enabled =
+        (gl_is_enabled_t) hw.get_proc_address("glIsEnabled");
+
+    gl_enable =
+        (gl_enable_t) hw.get_proc_address("glEnable");
+
+    gl_disable =
+        (gl_disable_t) hw.get_proc_address("glDisable");
+
+    gl_scissor =
+        (gl_scissor_t) hw.get_proc_address("glScissor");
+}
+
+
+static unsigned long sample_rgb_sum(void)
+{
+    unsigned char pixels[32 * 32 * 4];
+    unsigned long sum = 0;
+    unsigned i;
+
+    if (gl_read_pixels == NULL)
+        return 0;
+
+    gl_read_pixels(
+        (int)screen_width / 2 - 16,
+        (int)screen_height / 2 - 16,
+        32, 32,
+        MOD_GL_RGBA,
+        MOD_GL_UNSIGNED_BYTE,
+        pixels);
+
+    for (i = 0; i < 32 * 32; i++)
+    {
+        sum += pixels[i * 4 + 0];
+        sum += pixels[i * 4 + 1];
+        sum += pixels[i * 4 + 2];
+    }
+
+    return sum;
+}
+
+static void present_default_framebuffer(void)
+{
+    static unsigned long present_count = 0;
+    uint32_t frontend_fbo;
+    bool trace;
+
+    present_count++;
+    trace = (present_count <= 10 || (present_count % 60) == 0);
+
+    if (!context_ready || hw.get_current_framebuffer == NULL)
+        return;
+
+    frontend_fbo = (uint32_t) hw.get_current_framebuffer();
+
+    if (frontend_fbo == 0)
+        return;
+
+    resolve_present_functions();
+
+    if (gl_bind_framebuffer == NULL || gl_blit_framebuffer == NULL)
+    {
+        if (!gl_present_logged)
+        {
+            lr_log(RETRO_LOG_WARN,
+                   "OpenGL framebuffer blit functions unavailable\n");
+            gl_present_logged = true;
+        }
+        return;
+    }
+
+    if (trace && gl_get_integerv != NULL)
+    {
+        int rfbo = -1, dfbo = -1, rb = -1, db = -1;
+        int vp[4] = {0, 0, 0, 0};
+
+        gl_get_integerv(MOD_GL_READ_FRAMEBUFFER_BINDING, &rfbo);
+        gl_get_integerv(MOD_GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+        gl_get_integerv(MOD_GL_READ_BUFFER, &rb);
+        gl_get_integerv(MOD_GL_DRAW_BUFFER, &db);
+        gl_get_integerv(MOD_GL_VIEWPORT, vp);
+
+        lr_log(RETRO_LOG_INFO,
+               "GL before #%lu: readFBO=%d drawFBO=%d readBuf=0x%x drawBuf=0x%x viewport=%d,%d %dx%d\n",
+               present_count, rfbo, dfbo, rb, db,
+               vp[0], vp[1], vp[2], vp[3]);
+    }
+
+    if (gl_get_error != NULL)
+        while (gl_get_error() != 0) {}
+
+    gl_bind_framebuffer(MOD_GL_READ_FRAMEBUFFER, 0);
+
+    if (gl_read_buffer != NULL)
+        gl_read_buffer(MOD_GL_BACK);
+
+    if (trace && gl_get_error != NULL)
+        lr_log(RETRO_LOG_INFO, "GL source #%lu error=0x%x\n",
+               present_count, gl_get_error());
+
+    if (trace && gl_read_pixels != NULL)
+        lr_log(RETRO_LOG_INFO, "PIX source #%lu rgb_sum=%lu\n",
+               present_count, sample_rgb_sum());
+
+    gl_bind_framebuffer(MOD_GL_DRAW_FRAMEBUFFER, frontend_fbo);
+
+    if (gl_draw_buffer != NULL)
+        gl_draw_buffer(MOD_GL_COLOR_ATTACHMENT0);
+
+    if (trace && gl_get_error != NULL)
+        lr_log(RETRO_LOG_INFO, "GL destination #%lu error=0x%x\n",
+               present_count, gl_get_error());
+
+    gl_blit_framebuffer(
+        0, 0, (int) screen_width, (int) screen_height,
+        0, 0, (int) screen_width, (int) screen_height,
+        MOD_GL_COLOR_BUFFER_BIT, MOD_GL_NEAREST);
+
+    if (trace && gl_get_error != NULL)
+        lr_log(RETRO_LOG_INFO, "GL blit #%lu error=0x%x\n",
+               present_count, gl_get_error());
+
+    if (trace && gl_read_pixels != NULL)
+    {
+        gl_bind_framebuffer(MOD_GL_READ_FRAMEBUFFER, frontend_fbo);
+
+        if (gl_read_buffer != NULL)
+            gl_read_buffer(MOD_GL_COLOR_ATTACHMENT0);
+
+        lr_log(RETRO_LOG_INFO, "PIX dest #%lu rgb_sum=%lu\n",
+               present_count, sample_rgb_sum());
+    }
+
+    gl_bind_framebuffer(MOD_GL_FRAMEBUFFER, frontend_fbo);
+
+    if (trace && gl_is_enabled != NULL && gl_get_integerv != NULL)
+    {
+        int scissor[4] = {0, 0, 0, 0};
+
+        gl_get_integerv(MOD_GL_SCISSOR_BOX, scissor);
+
+        lr_log(RETRO_LOG_INFO,
+               "GL state #%lu: scissor=%d depth=%d blend=%d cull=%d stencil=%d box=%d,%d %dx%d\n",
+               present_count,
+               gl_is_enabled(MOD_GL_SCISSOR_TEST),
+               gl_is_enabled(MOD_GL_DEPTH_TEST),
+               gl_is_enabled(MOD_GL_BLEND),
+               gl_is_enabled(MOD_GL_CULL_FACE),
+               gl_is_enabled(MOD_GL_STENCIL_TEST),
+               scissor[0], scissor[1], scissor[2], scissor[3]);
+    }
+
+    if (!gl_present_logged)
+    {
+        lr_log(RETRO_LOG_INFO,
+               "presenting framebuffer 0 -> RetroArch FBO %u\n",
+               frontend_fbo);
+        gl_present_logged = true;
+    }
+}
 
 static char runtime_dir[PATH_MAX];
 static char core_path[PATH_MAX];
@@ -271,6 +557,67 @@ static m64p_error vidext_get_attr(m64p_GLattr attr, int *value)
 
 static m64p_error vidext_swap_buffers(void)
 {
+    static unsigned long swap_count = 0;
+
+    swap_count++;
+
+    if (swap_count <= 10 || (swap_count % 60) == 0)
+        lr_log(RETRO_LOG_INFO,
+               "VidExt_GL_SwapBuffers #%lu, frontend FBO=%u\n",
+               swap_count,
+               vidext_default_fbo());
+    typedef void (*gl_finish_t)(void);
+    static gl_finish_t finish_cb = NULL;
+
+    present_default_framebuffer();
+
+    if (finish_cb == NULL && hw.get_proc_address != NULL)
+        finish_cb = (gl_finish_t) hw.get_proc_address("glFinish");
+
+    if (finish_cb != NULL)
+        finish_cb();
+
+    /*
+     * Glide64mk2 leaves GL state active. RetroArch expects the HW
+     * renderer to give the context back in a neutral state.
+     */
+    if (gl_disable != NULL)
+    {
+        gl_disable(MOD_GL_SCISSOR_TEST);
+        gl_disable(MOD_GL_BLEND);
+        gl_disable(MOD_GL_DEPTH_TEST);
+        gl_disable(MOD_GL_CULL_FACE);
+        gl_disable(MOD_GL_STENCIL_TEST);
+    }
+
+    /*
+     * Save Glide64mk2 shader/texture state, then give RetroArch
+     * a neutral GL state. RetroArch keeps its own GL state cache
+     * and must not inherit the plugin's current program.
+     */
+    if (gl_get_integerv != NULL &&
+        gl_use_program != NULL &&
+        gl_active_texture != NULL &&
+        gl_bind_texture != NULL)
+    {
+        gl_get_integerv(MOD_GL_CURRENT_PROGRAM, &saved_gl_program);
+        gl_get_integerv(MOD_GL_ACTIVE_TEXTURE, &saved_gl_active_texture);
+        gl_get_integerv(MOD_GL_TEXTURE_BINDING_2D, &saved_gl_texture_2d);
+
+        /*
+         * RetroArch expects texture unit 0 in a neutral state.
+         * Preserve Glide64mk2's binding there before clearing it.
+         */
+        gl_active_texture(MOD_GL_TEXTURE0);
+        gl_get_integerv(MOD_GL_TEXTURE_BINDING_2D,
+                        &saved_gl_texture0_2d);
+
+        gl_use_program(0);
+        gl_bind_texture(MOD_GL_TEXTURE_2D, 0);
+
+        saved_gl_handoff = true;
+    }
+
     frame_ready = true;
 
     if (emulating && game_thread != NULL && retro_thread != NULL)
@@ -634,6 +981,72 @@ RETRO_API void retro_run(void)
         if (video_cb)
             video_cb(NULL, screen_width, screen_height, 0);
         return;
+    }
+
+    /*
+     * RetroArch needed its own FBO bound while video_cb() presented
+     * the previous frame.  Glide64mk2 expects the normal/default
+     * framebuffer again when emulation resumes.
+     */
+    resolve_present_functions();
+    if (gl_bind_framebuffer != NULL)
+        gl_bind_framebuffer(MOD_GL_FRAMEBUFFER, 0);
+
+    if (gl_draw_buffer != NULL)
+        gl_draw_buffer(MOD_GL_BACK);
+
+    if (gl_read_buffer != NULL)
+        gl_read_buffer(MOD_GL_BACK);
+
+    /*
+     * RetroArch changes the GL viewport while presenting the HW frame.
+     * Glide64mk2 expects its original 640x480 viewport when it resumes.
+     */
+    if (gl_viewport != NULL)
+        gl_viewport(0, 0, (int) screen_width, (int) screen_height);
+
+    if (gl_scissor != NULL)
+        gl_scissor(0, 0, (int) screen_width, (int) screen_height);
+
+    if (gl_enable != NULL)
+    {
+        gl_enable(MOD_GL_SCISSOR_TEST);
+        gl_enable(MOD_GL_BLEND);
+    }
+
+    if (gl_disable != NULL)
+    {
+        gl_disable(MOD_GL_DEPTH_TEST);
+        gl_disable(MOD_GL_CULL_FACE);
+        gl_disable(MOD_GL_STENCIL_TEST);
+    }
+
+    /*
+     * RetroArch has finished presenting. Restore exactly the GL
+     * program/texture state Glide64mk2 had when it yielded.
+     */
+    if (saved_gl_handoff &&
+        gl_use_program != NULL &&
+        gl_active_texture != NULL &&
+        gl_bind_texture != NULL)
+    {
+        /*
+         * Restore texture unit 0 first.
+         */
+        gl_active_texture(MOD_GL_TEXTURE0);
+        gl_bind_texture(MOD_GL_TEXTURE_2D,
+                        (unsigned int) saved_gl_texture0_2d);
+
+        /*
+         * Restore the texture unit Glide64mk2 actually had active.
+         */
+        gl_active_texture((unsigned int) saved_gl_active_texture);
+        gl_bind_texture(MOD_GL_TEXTURE_2D,
+                        (unsigned int) saved_gl_texture_2d);
+
+        gl_use_program((unsigned int) saved_gl_program);
+
+        saved_gl_handoff = false;
     }
 
     frame_ready = false;
