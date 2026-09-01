@@ -1,0 +1,17 @@
+name: Modular probe build
+
+on:
+  push:
+    branches:
+      - modular-plugins
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build modular loader probe
+        run: make -C modular
