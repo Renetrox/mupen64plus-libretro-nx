@@ -1,83 +1,108 @@
 # Modular Mupen64Plus / libretro experiment
 
-This directory starts a separate, non-destructive experiment on the `modular-plugins` branch.
-The existing Mupen64Plus-Next build is intentionally left untouched while the modular architecture is validated.
+This directory is a separate, non-destructive experiment on the `modular-plugins` branch. The existing Mupen64Plus-Next build remains untouched while the modular architecture is validated.
 
-## Goal
-
-The final runtime should keep the normal Mupen64Plus module boundary instead of compiling every graphics/RSP plugin into one libretro binary:
+## Architecture
 
 ```text
 RetroArch
     |
     v
-mupen64plus_modular_libretro.so   (frontend / bridge only)
+mupen64plus_modular_libretro.so   (thin frontend / bridge)
     |
-    +-- libmupen64plus.so
-    |
-    +-- mupen64plus-video-glide64mk2.so
-    +-- mupen64plus-video-rice.so
-    +-- mupen64plus-video-gln64.so
-    |
-    +-- mupen64plus-rsp-hle.so
-    +-- ...
+    +-- libmupen64plus.so.2       (real standalone Mupen64Plus core)
+            |
+            +-- mupen64plus-video-glide64mk2.so
+            +-- mupen64plus-video-GLideN64.so
+            +-- mupen64plus-audio-sdl.so       [temporary]
+            +-- mupen64plus-input-sdl.so       [temporary]
+            +-- mupen64plus-rsp-hle.so
 ```
 
-Graphics plugins remain ordinary Mupen64Plus shared libraries. Selecting a different graphics plugin should only change which `.so` the libretro bridge loads when content starts.
+The graphics plugins remain ordinary Mupen64Plus shared libraries. They are not linked into the libretro core.
 
-## Phase 0: prove the module boundary
-
-`m64p-modular-probe` is deliberately **not** a libretro core yet. It validates the important part first:
-
-1. `dlopen()` a real external `libmupen64plus.so`.
-2. Resolve the official frontend API (`CoreStartup`, `CoreAttachPlugin`, `CoreDoCommand`, `CoreOverrideVidExt`, ...).
-3. `dlopen()` normal external Mupen64Plus plugins.
-4. Call each plugin's `PluginStartup()` with the real core handle.
-5. Attach each plugin through `CoreAttachPlugin()`.
-6. Detach/shutdown everything cleanly.
-
-This tells us whether the standalone Linux core/plugins can be kept intact before adding RetroArch video, audio and input bridging.
-
-## Build (Linux)
+## Build
 
 From the repository root:
 
 ```sh
 cd modular
-make
+make clean
+make -j$(nproc)
 ```
 
-The test program only links against `libdl`; it does **not** link Mupen64Plus or a graphics plugin into the executable.
+This currently builds two targets:
 
-## Examples
-
-Let the dynamic linker find the Mupen64Plus core and test only a graphics plugin:
-
-```sh
-./m64p-modular-probe - /path/to/mupen64plus-video-glide64mk2.so
+```text
+m64p-modular-probe
+mupen64plus_modular_libretro.so
 ```
 
-Test the complete normal Mupen64Plus plugin set:
+`m64p-modular-probe` validates the standalone Mupen64Plus ABI and plugin loader without RetroArch.
+
+`mupen64plus_modular_libretro.so` is the first real libretro wrapper. It requests a RetroArch OpenGL context, installs a Mupen64Plus `CoreOverrideVidExt()` table, opens the ROM, dynamically loads normal Mupen64Plus plugins and runs the blocking Mupen64Plus execution loop in a libco coroutine. `VidExt_GL_SwapBuffers()` yields back to `retro_run()`.
+
+## Runtime layout
+
+The wrapper automatically searches for `runtime/` beside the libretro core and then one directory above it. The repository development layout can therefore be:
+
+```text
+mupen64plus-libretro-nx/
+├── modular/
+│   └── mupen64plus_modular_libretro.so
+└── runtime/
+    ├── libmupen64plus.so.2
+    ├── mupen64plus.ini                 [recommended if available]
+    └── plugins/
+        ├── mupen64plus-video-glide64mk2.so
+        ├── mupen64plus-video-GLideN64.so
+        ├── mupen64plus-audio-sdl.so
+        ├── mupen64plus-input-sdl.so
+        └── mupen64plus-rsp-hle.so
+```
+
+Shared data files used by standalone Mupen64Plus/plugins can also be copied into `runtime/` during early testing.
+
+## Probe example
 
 ```sh
 ./m64p-modular-probe \
-  /path/to/libmupen64plus.so.2 \
-  /path/to/mupen64plus-video-glide64mk2.so \
-  /path/to/mupen64plus-audio-sdl.so \
-  /path/to/mupen64plus-input-sdl.so \
-  /path/to/mupen64plus-rsp-hle.so
+  ../runtime/libmupen64plus.so.2 \
+  ../runtime/plugins/mupen64plus-video-glide64mk2.so \
+  ../runtime/plugins/mupen64plus-audio-sdl.so \
+  ../runtime/plugins/mupen64plus-input-sdl.so \
+  ../runtime/plugins/mupen64plus-rsp-hle.so
 ```
 
-Use `-` for any plugin slot that should be skipped.
+## RetroArch proof-of-concept
 
-## Next milestone
+From the repository root, after building and preparing `runtime/`:
 
-Once this probe succeeds on Linux/ARM64, the next layer is the actual libretro bridge:
+```sh
+retroarch -L ./modular/mupen64plus_modular_libretro.so /path/to/game.z64
+```
 
-- reuse the proven libretro execution/cothread strategy from Mupen64Plus-Next;
-- provide `CoreOverrideVidExt()` callbacks backed by the libretro hardware context;
-- provide libretro-native audio and input plugins/bridges;
-- expose a `Video Plugin` core option;
-- load Glide64mk2 first, then Rice as the second proof of interchangeable external graphics modules.
+The first core option is:
 
-FZ is only a reference for how useful options can be grouped/exposed per plugin. It is not a runtime dependency and its Android frontend/profile system is not part of this design.
+```text
+Video Plugin
+  glide64mk2
+  GLideN64
+```
+
+Restart content after changing the graphics plugin.
+
+## Current limitations
+
+This is deliberately an early proof of architecture:
+
+- audio currently uses the external SDL Mupen64Plus plugin, not a libretro audio bridge;
+- input currently uses the external SDL Mupen64Plus plugin, not a libretro input bridge;
+- savestates and exposed memory are not implemented yet;
+- only OpenGL is requested at this stage;
+- plugin-level frameskip and full plugin option categories come later;
+- frame yielding currently follows the graphics plugin's buffer-swap path and must be tested with skipped frames.
+
+The next target is to boot a game with external Glide64mk2, then repeat the same test with GLideN64 by changing only the loaded graphics `.so`. After that, SDL audio/input will be replaced by small libretro-native bridge plugins.
+
+FZ remains only a reference for useful per-plugin options and organization. Its Android frontend/profile system is not a runtime dependency.
