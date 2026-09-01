@@ -181,7 +181,7 @@ m64p_error m64p_modular_plugin_load(m64p_modular_core *core,
         goto fail;
 
     result = get_version(&plugin->type, &plugin->version, &plugin->api_version,
-                         &plugin->name, NULL);
+                         &plugin->name, &plugin->capabilities);
     if (result != M64ERR_SUCCESS)
     {
         set_error("PluginGetVersion failed for %s (error %d)", path, result);
