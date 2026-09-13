@@ -78,14 +78,15 @@ static int l_PluginInit = 0;
  * the RSP task and schedules DP_INT through its normal timing path.
  *
  * The first prototype reuses the existing Frame Duplication core-option slot
- * at shared-library load time. This avoids invasive edits to the very large
- * generated core-options table while the behaviour is being validated. The
- * option is exposed as:
+ * at shared-library load time. IMPORTANT: the option key intentionally stays
+ * CORE_NAME "-FrameDuping" because libretro.c still queries that key. Only the
+ * visible label/values are repurposed here:
  *
  *     HLE Frameskip: Disabled / Auto
  *
- * Frame Duplication is therefore intentionally unavailable on this
- * experimental branch until the option gets its own permanent table entry.
+ * Keeping the original key avoids an invalid GET_VARIABLE request while this
+ * prototype is being validated. Auto also leaves NX frame duplication enabled
+ * on skipped presentations, which is acceptable for this experimental stage.
  */
 static int hle_frameskip_enabled = 0;
 static unsigned hle_frameskip_skip_pending = 0;
@@ -109,7 +110,6 @@ static void hle_frameskip_patch_core_option(void)
     {
         if (strcmp(option_defs_us[i].key, CORE_NAME "-FrameDuping") == 0)
         {
-            option_defs_us[i].key = CORE_NAME "-hle-frameskip";
             option_defs_us[i].desc = "HLE Frameskip";
             option_defs_us[i].desc_categorized = NULL;
             option_defs_us[i].info =
@@ -117,13 +117,13 @@ static void hle_frameskip_patch_core_option(void)
                 "Only active with the HLE RSP. LLE RSP paths are not skipped.";
             option_defs_us[i].info_categorized = NULL;
             option_defs_us[i].category_key = NULL;
-            option_defs_us[i].values[0].value = "Disabled";
-            option_defs_us[i].values[0].label = NULL;
+            option_defs_us[i].values[0].value = "False";
+            option_defs_us[i].values[0].label = "Disabled";
             option_defs_us[i].values[1].value = "Auto";
-            option_defs_us[i].values[1].label = NULL;
+            option_defs_us[i].values[1].label = "Auto";
             option_defs_us[i].values[2].value = NULL;
             option_defs_us[i].values[2].label = NULL;
-            option_defs_us[i].default_value = "Disabled";
+            option_defs_us[i].default_value = "False";
             break;
         }
     }
@@ -144,7 +144,7 @@ static void hle_frameskip_read_option(void)
 
     if (environ_cb != NULL)
     {
-        var.key = CORE_NAME "-hle-frameskip";
+        var.key = CORE_NAME "-FrameDuping";
         var.value = NULL;
         if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value != NULL)
             enabled = (strcmp(var.value, "Auto") == 0);
@@ -276,6 +276,9 @@ void HleProcessDlistList(void* UNUSED(user_defined))
 {
     if (l_ProcessDlistList == NULL)
         return;
+
+    /* Allow Disabled/Auto to be changed from Core Options at runtime. */
+    hle_frameskip_read_option();
 
     if (hle_frameskip_should_skip())
     {
