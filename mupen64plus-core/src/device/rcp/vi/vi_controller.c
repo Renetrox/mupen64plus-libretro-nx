@@ -31,6 +31,9 @@
 #include "plugin/plugin.h"
 #include <mupen64plus-next_common.h>
 
+/* Experimental libretro HLE frameskip VI boundary hook. */
+extern void hle_frameskip_on_vi(void);
+
 unsigned int vi_clock_from_tv_standard(m64p_system_type tv_standard)
 {
     switch(tv_standard)
@@ -171,6 +174,10 @@ void vi_vertical_interrupt_event(void* opaque)
         vi->dp->do_on_unfreeze |= DELAY_UPDATESCREEN;
     else
         gfx.updateScreen();
+
+    /* One frameskip timing/decision update per real N64 VI, before new_vi()
+     * yields back to the libretro frontend. */
+    hle_frameskip_on_vi();
 
     /* allow main module to do things on VI event */
     new_vi();

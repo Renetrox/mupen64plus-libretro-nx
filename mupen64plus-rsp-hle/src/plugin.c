@@ -72,27 +72,33 @@ static int l_PluginInit = 0;
 /*
  * Experimental HLE frameskip ported from the FZ/ReARMed work.
  *
- * This deliberately lives at the HLE DList boundary instead of suppressing
- * video_cb() after the renderer has already done its work. When a frame is
- * skipped we still raise MI_INTR_DP; mupen64plus-core consumes that bit after
- * the RSP task and schedules DP_INT through its normal timing path.
+ * Frames are skipped at the HLE graphics DList boundary, before GLideN64 does
+ * the expensive renderer work. The skip decision is made once per real VI and
+ * cached for every graphics DList belonging to that VI. This is important:
+ * deciding independently for each DList can leave the renderer halfway through
+ * a frame and cause severe presentation corruption.
  *
- * The first prototype reuses the existing Frame Duplication core-option slot
- * at shared-library load time. IMPORTANT: the option key intentionally stays
- * CORE_NAME "-FrameDuping" because libretro.c still queries that key. Only the
- * visible label/values are repurposed here:
+ * A skipped graphics task still raises MI_INTR_DP. mupen64plus-core consumes
+ * that bit after the RSP task and schedules DP_INT through its normal delayed
+ * timing path.
+ *
+ * This prototype still reuses the Frame Duplication option slot while the
+ * behaviour is being validated. The key stays CORE_NAME "-FrameDuping", but
+ * the visible option is:
  *
  *     HLE Frameskip: Disabled / Auto
  *
- * Keeping the original key avoids an invalid GET_VARIABLE request while this
- * prototype is being validated. Auto also leaves NX frame duplication enabled
- * on skipped presentations, which is acceptable for this experimental stage.
+ * Auto explicitly disables libretro frame duplication so the two mechanisms
+ * are never stacked on top of each other.
  */
 static int hle_frameskip_enabled = 0;
 static unsigned hle_frameskip_skip_pending = 0;
 static unsigned hle_frameskip_consecutive = 0;
 static uint64_t hle_frameskip_initial_usec = 0;
 static uint64_t hle_frameskip_virtual_count = 0;
+static uint64_t hle_frameskip_vi_serial = 0;
+static uint64_t hle_frameskip_decision_vi = (uint64_t)-1;
+static int hle_frameskip_skip_current_vi = 0;
 
 static void hle_frameskip_reset(void)
 {
@@ -100,6 +106,9 @@ static void hle_frameskip_reset(void)
     hle_frameskip_consecutive = 0;
     hle_frameskip_initial_usec = 0;
     hle_frameskip_virtual_count = 0;
+    hle_frameskip_vi_serial = 0;
+    hle_frameskip_decision_vi = (uint64_t)-1;
+    hle_frameskip_skip_current_vi = 0;
 }
 
 static void hle_frameskip_patch_core_option(void)
@@ -150,6 +159,11 @@ static void hle_frameskip_read_option(void)
             enabled = (strcmp(var.value, "Auto") == 0);
     }
 
+    /* The temporary option slot makes libretro.c interpret Auto as frame
+     * duplication enabled. Do not stack frame duplication with HLE skipping. */
+    if (enabled)
+        EnableFrameDuping = 0;
+
     if (hle_frameskip_enabled != enabled)
     {
         hle_frameskip_enabled = enabled;
@@ -162,59 +176,82 @@ static int hle_frameskip_should_skip(void)
     if (!hle_frameskip_enabled || l_MI_INTR_REG == NULL)
         return 0;
 
-    if (!hle_frameskip_skip_pending)
+    /* Every graphics DList in one VI must see exactly the same decision. */
+    if (hle_frameskip_decision_vi == hle_frameskip_vi_serial)
+        return hle_frameskip_skip_current_vi;
+
+    hle_frameskip_decision_vi = hle_frameskip_vi_serial;
+    hle_frameskip_skip_current_vi = 0;
+
+    if (hle_frameskip_skip_pending)
+    {
+        if (hle_frameskip_consecutive < HLE_FRAMESKIP_AUTO_MAX)
+        {
+            hle_frameskip_skip_pending = 0;
+            hle_frameskip_consecutive++;
+            hle_frameskip_skip_current_vi = 1;
+        }
+        else
+        {
+            /* Force one complete rendered VI after two consecutive skips.
+             * Keep the pending request for the next graphics-bearing VI. */
+            hle_frameskip_consecutive = 0;
+        }
+    }
+    else
     {
         hle_frameskip_consecutive = 0;
-        return 0;
     }
 
-    if (hle_frameskip_consecutive >= HLE_FRAMESKIP_AUTO_MAX)
-    {
-        /* Force one rendered frame, then keep the pending catch-up request. */
-        hle_frameskip_consecutive = 0;
-        return 0;
-    }
-
-    hle_frameskip_skip_pending = 0;
-    hle_frameskip_consecutive++;
-    return 1;
+    return hle_frameskip_skip_current_vi;
 }
 
-static void hle_frameskip_update(void)
+/* Called exactly once at the real N64 VI boundary. The timing result from the
+ * completed VI becomes the pending decision for the following VI. */
+void hle_frameskip_on_vi(void)
 {
     uint64_t now;
     uint64_t elapsed;
     uint64_t real_count;
     unsigned target_fps;
 
-    if (!hle_frameskip_enabled || perf_cb.get_time_usec == NULL)
+    hle_frameskip_read_option();
+
+    if (!hle_frameskip_enabled)
         return;
 
-    now = (uint64_t) perf_cb.get_time_usec();
-    target_fps = (retro_get_region() == RETRO_REGION_PAL) ? 50u : 60u;
-
-    if (hle_frameskip_initial_usec == 0 || now <= hle_frameskip_initial_usec)
+    if (perf_cb.get_time_usec != NULL)
     {
-        hle_frameskip_initial_usec = now;
-        hle_frameskip_virtual_count = 0;
-        hle_frameskip_skip_pending = 0;
-        hle_frameskip_consecutive = 0;
-        return;
+        now = (uint64_t) perf_cb.get_time_usec();
+        target_fps = (retro_get_region() == RETRO_REGION_PAL) ? 50u : 60u;
+
+        if (hle_frameskip_initial_usec == 0 || now <= hle_frameskip_initial_usec)
+        {
+            hle_frameskip_initial_usec = now;
+            hle_frameskip_virtual_count = 0;
+            hle_frameskip_skip_pending = 0;
+            hle_frameskip_consecutive = 0;
+        }
+        else
+        {
+            elapsed = now - hle_frameskip_initial_usec;
+            real_count = (elapsed * target_fps) / 1000000u;
+
+            hle_frameskip_virtual_count++;
+
+            if (real_count > hle_frameskip_virtual_count)
+            {
+                hle_frameskip_skip_pending = 1;
+            }
+            else if (real_count < hle_frameskip_virtual_count)
+            {
+                hle_frameskip_virtual_count = real_count;
+            }
+        }
     }
 
-    elapsed = now - hle_frameskip_initial_usec;
-    real_count = (elapsed * target_fps) / 1000000u;
-
-    hle_frameskip_virtual_count++;
-
-    if (real_count > hle_frameskip_virtual_count)
-    {
-        hle_frameskip_skip_pending = 1;
-    }
-    else if (real_count < hle_frameskip_virtual_count)
-    {
-        hle_frameskip_virtual_count = real_count;
-    }
+    /* Start a new cached decision domain for the next VI. */
+    hle_frameskip_vi_serial++;
 }
 
 EXPORT m64p_error CALL hlePluginGetVersion(m64p_plugin_type *PluginType, int *PluginVersion, int *APIVersion, const char **PluginNamePtr, int *Capabilities)
@@ -247,8 +284,6 @@ static void DebugMessage(int level, const char *message, va_list args)
         return;
 
     vsprintf(msgbuf, message, args);
-
-    (*l_DebugCallback)(l_DebugCallContext, level, msgbuf);
 }
 
 /* Global functions needed by HLE core */
@@ -282,21 +317,16 @@ void HleProcessDlistList(void* UNUSED(user_defined))
 
     if (hle_frameskip_should_skip())
     {
-        /*
-         * hle.c has already marked the RSP task TASKDONE/BROKE/HALT.
+        /* hle.c has already marked the RSP task TASKDONE/BROKE/HALT.
          * Raising DP here mirrors a completed graphics task without invoking
-         * the renderer. mupen64plus-core turns MI_INTR_DP into the normal
-         * delayed DP_INT immediately after rsp.doRspCycles() returns.
-         */
+         * the renderer. mupen64plus-core converts MI_INTR_DP to its normal
+         * delayed DP_INT after rsp.doRspCycles() returns. */
         *l_MI_INTR_REG |= MI_INTR_DP;
     }
     else
     {
         (*l_ProcessDlistList)();
     }
-
-    /* The current graphics task has now completed; decide catch-up for next. */
-    hle_frameskip_update();
 }
 
 void HleProcessAlistList(void* UNUSED(user_defined))
@@ -339,9 +369,6 @@ EXPORT m64p_error CALL hlePluginStartup(m64p_dynlib_handle CoreLibHandle, void *
     l_DebugCallback = DebugCallback;
     l_DebugCallContext = Context;
 
-    /* On non-GNU toolchains there is no constructor above; patching here is
-     * still useful, although frontends may already have consumed the option
-     * table by this point. */
     hle_frameskip_patch_core_option();
     hle_frameskip_read_option();
 
